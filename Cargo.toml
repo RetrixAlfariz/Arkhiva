@@ -1,0 +1,34 @@
+[package]
+name = "arkhiva"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Local research companion for searching and organizing arXiv paper metadata offline"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["arxiv", "search", "papers", "tantivy", "parquet"]
+categories = ["command-line-utilities", "science"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+arrow-array = "60.1"
+arrow-schema = "60.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+httpdate = "1"
+parquet = { version = "60.1", default-features = false, features = ["arrow", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+roxmltree = "0.21"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tantivy = "0.27"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
