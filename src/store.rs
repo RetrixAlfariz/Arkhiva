@@ -1,11 +1,12 @@
 use crate::model::{Change, Paper};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     path::Path,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 const PARQUET_APPLICATION_ID: i32 = 0x4152_5051;
@@ -61,17 +62,23 @@ pub struct SnapshotRow {
 
 impl Store {
     pub fn open(path: &Path, provider: &'static str) -> Result<Self> {
-        Self::open_with_application(path, provider, 0)
+        Self::open_with_application(path, provider, 0, false)
     }
 
-    pub(crate) fn open_parquet_index(path: &Path, provider: &'static str) -> Result<Self> {
-        Self::open_with_application(path, provider, PARQUET_APPLICATION_ID)
+    /// `shared` opens for reading alongside other readers; writers need the exclusive lock.
+    pub(crate) fn open_parquet_index(
+        path: &Path,
+        provider: &'static str,
+        shared: bool,
+    ) -> Result<Self> {
+        Self::open_with_application(path, provider, PARQUET_APPLICATION_ID, shared)
     }
 
     fn open_with_application(
         path: &Path,
         provider: &'static str,
         application: i32,
+        shared: bool,
     ) -> Result<Self> {
         let absolute = if path.exists() {
             path.canonicalize()?
@@ -92,8 +99,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(lock_path)?;
-        lock.try_lock()
-            .context("database is locked by another Arkhiva process")?;
+        acquire(&lock, shared)?;
         let mut conn = Connection::open(absolute)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -116,6 +122,10 @@ impl Store {
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
         if uninitialized || version < latest {
+            ensure!(
+                !shared,
+                "the corpus index needs a schema upgrade; run a writing command such as `arkhiva sync` first"
+            );
             let tx = conn.transaction()?;
             if uninitialized {
                 tx.execute_batch(include_str!("../migrations/001.sql"))?;
@@ -352,4 +362,39 @@ fn apply_oai(tx: &Transaction<'_>, provider: &str, datestamp: &str, change: Chan
         }
     }
     Ok(())
+}
+
+/// Searches finish within seconds while a sync can run for minutes, so writers wait briefly
+/// for readers to finish and readers give up quickly while a writer holds the lock.
+fn acquire(lock: &File, shared: bool) -> Result<()> {
+    let patience = if cfg!(test) {
+        Duration::from_millis(200)
+    } else if shared {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
+    };
+    let deadline = Instant::now() + patience;
+    loop {
+        let attempt = if shared {
+            lock.try_lock_shared()
+        } else {
+            lock.try_lock()
+        };
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) if shared => {
+                bail!(
+                    "the corpus is being updated by another Arkhiva process; retry when it finishes"
+                )
+            }
+            Err(TryLockError::WouldBlock) => {
+                bail!("the corpus is in use by another Arkhiva process; retry when it finishes")
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }

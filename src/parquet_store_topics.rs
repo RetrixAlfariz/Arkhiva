@@ -6,8 +6,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct TopicPlan {
+    // Topics saved before the planned search hold keywords; newer ones hold the plan.
+    #[serde(default)]
     pub(super) keywords: Vec<String>,
+    #[serde(default)]
     pub(super) preferred_categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) smart: Option<crate::smart_search::Plan>,
     pub(super) category: Option<String>,
     pub(super) tag: Option<String>,
     pub(super) from: Option<NaiveDate>,

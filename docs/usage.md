@@ -48,7 +48,13 @@ Each Parquet record stores the first submission date as `first_submitted_on`. Ca
 
 Each sync fetches one OAI-PMH harvest and exits after the final page and Tantivy refresh. Progress goes to stderr, leaving the report JSON on stdout. It shows a progress bar when arXiv reports a usable size estimate and committed batch and record counts otherwise. An interrupted harvest can resume from its saved checkpoint.
 
+Build the local phrase lexicon with `arkhiva parquet lexicon`. Parquet sync refreshes it after updating Tantivy. The initial build scans titles and abstracts with the corpus write lock. Later runs scan only added Parquet parts; a replaced or removed part, such as after `migrate-schema`, rebuilds the lexicon from scratch. A retry publishes counts atomically. Query the SQLite sidecar `lexicon-v2.sqlite` with `SELECT doc_freq FROM lexicon WHERE phrase = 'visual servoing'`.
+
+The lexicon counts documents containing a contiguous phrase of one to three tokens. Case and common hyphens are normalized. Punctuation and numeric-only tokens break phrases. Function words may occur inside a phrase, but cannot start or end it. The filter also excludes selected generic entries. Only phrases found in at least three papers are kept, which keeps the sidecar a fraction of the corpus size. A phrase dropped earlier starts counting again from zero when a later sync mentions it, so its total can lag by up to two papers until the next full rebuild. The lexicon is computed independently of smart search.
+
 Parquet sync keeps each paper's metadata as first collected after the seed. It skips known IDs and OAI deletion notices. The SQLite sync documented below continues to apply revisions and deletions.
+
+Several read commands can use one corpus at once: `search` (including `--smart` and `--topic`), `parquet get`, `status`, and `topic list`. Writing commands take the corpus alone: `sync`, `tag`, `topic remove`, `parquet migrate-schema`, and `search --smart --save-topic`. A writer waits up to 10 seconds for running searches to finish. A read started during a sync gives up after 2 seconds and asks you to retry. If a seed or an interrupted sync left the Tantivy index behind, the next search briefly takes the corpus alone to bring it up to date.
 
 For external reads, use the registered files rather than globbing while an ingest is in progress. The list is available from the small SQLite index:
 
@@ -91,30 +97,79 @@ Manual tags live in the corpus SQLite index and can be combined with text, categ
 
 ### Search with a research prompt
 
-Prompt search uses Qwen3.5-0.8B GGUF with `llama-server`. To start the server on demand, put `arkhiva-llama.json` next to the corpus's `index.sqlite`. Paths can be absolute or relative to the corpus directory. [llama-server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+Prompt search asks a model for one search plan, then searches the corpus itself. It needs the phrase lexicon (`arkhiva parquet lexicon`). The model can be a local `llama-server` or any OpenAI-compatible API. Small local models often fail the plan's JSON schema; Qwen3.5-9B worked in testing.
+
+To start a local server on demand, put `arkhiva-llama.json` next to the corpus's `index.sqlite`. Paths can be absolute or relative to the corpus directory. [llama-server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 
 ```json
 {
   "port": 18117,
   "model_alias": "arkhiva-qwen",
   "server_executable": "C:/tools/llama.cpp/llama-server.exe",
-  "model_file": "C:/models/Qwen3.5-0.8B-Q4_K_M.gguf"
+  "model_file": "C:/models/Qwen3.5-9B-Q4_K_M.gguf"
 }
-```
-
-```powershell
-arkhiva search --smart "Aku mau mencari cara menggabungkan data AIS dan sinyal radio untuk melacak kapal." --limit 5
 ```
 
 The first smart search starts the server on loopback and waits for it to load. Later searches reuse the server. After five idle minutes it releases model memory and reloads on demand. Set `runtime_library_dir` if CUDA DLLs are in a separate directory. Arkhiva adds it to the server process's `PATH`. To use an already running server, configure its `port` and `model_alias` and omit both path fields. The default external endpoint is `127.0.0.1:18117` with alias `arkhiva-qwen`.
 
-The model extracts English keywords. The initial search reads only the categories of the leading matches. Arkhiva can choose a category directly when it occurs in at least seven of the first eight hits, including the first three, and every other shortlisted category occurs in fewer than six of those eight hits. For mixed results, the model chooses from the shortlist. Arkhiva reads abstracts and generates snippets for the final hits only. [arXiv taxonomy](https://arxiv.org/category_taxonomy)
+To use an API instead, add its settings to `arkhiva-llama.json` or set environment variables; Arkhiva then starts no local server. Only the plan instructions and your prompt are sent; the corpus and results stay local.
 
-Smart search JSON includes `keywords`, `categories`, `category_mode`, `category_source`, and `hits`. Category sources are `consensus`, `model`, `manual`, and `none`. Automatically chosen categories boost ranking. Pass `--category` to restrict results to one category. Date and tag filters apply throughout. Regular `arkhiva search` runs independently of the model.
+```json
+{
+  "api_url": "https://api.openai.com/v1",
+  "api_model": "gpt-6-luna",
+  "api_reasoning": "none",
+  "api_temperature": 0
+}
+```
+
+The key never goes in the file; set `OPENAI_API_KEY` or `ARKHIVA_LLM_KEY` in your environment. Each environment variable below overrides its file setting for that session.
+
+To keep both setups in one file and pick one, add `"llm": "api"` or `"llm": "local"`. Without `llm`, Arkhiva uses the API when `api_url` is set and the local server otherwise. `ARKHIVA_LLM_URL` always selects the API.
+
+| Variable | Meaning |
+|---|---|
+| `ARKHIVA_LLM_URL` | `api_url`: API base, such as `https://api.openai.com/v1` (https, or http on localhost) |
+| `ARKHIVA_LLM_MODEL` | `api_model`: model name, required with the URL |
+| `ARKHIVA_LLM_KEY` | API key; falls back to `OPENAI_API_KEY` |
+| `ARKHIVA_LLM_REASONING` | `api_reasoning`: optional `reasoning_effort`, such as `none` |
+| `ARKHIVA_LLM_TEMPERATURE` | `api_temperature`: optional temperature, for models that accept one |
+
+```powershell
+arkhiva search --smart "algoritma kompresi file; cepat; lightweight" --limit 10
+arkhiva search --smart "Aku mau bikin drone yang terbang sendiri di gudang tanpa GPS" --all
+```
+
+The plan has an intent (`known`, `topic`, or `question`), guessed titles for a known paper, anchors (domain words such as `compression`), facets (sub-needs with English terms), constraints (requirements the prompt states, such as fast or real-time), and an avoid list (phrases of a different meaning). Arkhiva keeps a facet term only if the lexicon finds it in 5 to 20,000 papers (a phrase longer than three words counts as its rarest piece), drops terms more than ten times broader than their siblings, and never substitutes another phrase. Each term is searched on its own, paired with each anchor. A guessed title counts only if a real title shares at least 60% of its words.
+
+Constraints never filter. A paper gets a bonus of half its score per constraint, up to double, when a constraint phrase or the prompt's own word (such as `fast`) appears in the same sentence of its title or full abstract as a facet term or anchor. A paper naming an avoid phrase keeps half its score. Hits are ordered by tier: `title` (the guessed paper), `contextual` (found with an anchor or by a rare term), `constraint` (found only through a constraint search), `extended` (a broad term without an anchor), and `expansion`.
+
+Smart search JSON includes the model's `plan`, the `grounded` terms that survived, `total` and `contextual` candidate counts, `timings_ms`, and `hits`. Each hit adds `tier`, `matched_terms`, `constraints` (the evidence phrase per constraint, or null), and `avoid_hit` when one applies. `--limit` caps the hits; `--all` lists every candidate. Category, date, and tag filters apply to every search. Regular `arkhiva search` runs independently of the model.
+
+### Add your own kamus and codec
+
+Two JSON files teach smart search your own words. A kamus maps a word to the English terms papers use, and those terms are always searched. A codec explains a word or phrase to the model, so it understands the prompt; a codec searches nothing by itself. Examples: [kamus.json](examples/kamus.json), [codec.json](examples/codec.json).
+
+```json
+{ "kompresi": ["data compression", "lossless compression"], "YOLO": ["you only look once"] }
+```
+
+```json
+{ "lightweight": "runs on a microcontroller or phone with under 1 MB of RAM and no GPU" }
+```
+
+```powershell
+arkhiva import kamus docs/examples/kamus.json
+arkhiva import codec docs/examples/codec.json
+```
+
+Entries are stored in the corpus's `index.sqlite`. Importing a word again replaces its entry; other entries stay. `arkhiva list kamus` and `arkhiva list codec` show every entry. Remove one entry with `arkhiva remove kamus <word>` or `arkhiva remove codec <word>`; type an all-capitals word in capitals. A file with any invalid entry imports nothing. Importing a kamus lists terms smart search would skip: those not found in the corpus, in fewer than 5 papers, or in more than 20,000. They are imported anyway.
+
+An entry applies when the prompt contains its word as whole words. Punctuation is ignored, and so is case, except for a key written entirely in capitals: `IT` or `YOLO` is an acronym and matches only in capitals, so `IT` never matches the word "it". Write a lowercase key too if you type the acronym in lowercase. Up to 20 kamus and 20 codec entries are sent with the prompt to the model. Each kamus entry is also added to the plan as a facet, minus terms the model already chose, and grounded like the model's own terms. The output lists applied entries under `glossary`.
 
 ### Save custom topics
 
-Save a smart search under a topic name to keep its prompt, keywords, categories, and filters in the local SQLite index. Opening a topic runs the saved plan on the current corpus, including eligible papers added since it was saved. It can open while the model server is offline. An explicit category, tag, or date bound on the opening command overrides the corresponding saved filter.
+Save a smart search under a topic name to keep its prompt, plan, and filters in the local SQLite index. Opening a topic replays the saved plan on the current corpus, including eligible papers added since it was saved, without calling the model. Topics saved by older versions keep their keyword search. An explicit category, tag, or date bound on the opening command overrides the corresponding saved filter.
 
 ```powershell
 arkhiva search --smart "Cari riset penggabungan AIS dan sinyal radio untuk pelacakan kapal" --save-topic maritime-ai
@@ -124,7 +179,7 @@ arkhiva topic list
 arkhiva topic remove maritime-ai
 ```
 
-Saving again under the same name replaces its plan. Search results from a saved topic have `category_source` set to `saved`.
+Saving again under the same name replaces its plan.
 
 ## Create or resume the corpus
 

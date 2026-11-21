@@ -21,8 +21,8 @@ use parquet::{
     file::{
         metadata::{KeyValue, PageIndexPolicy, ParquetMetaData, page_index::PageIndexBuilder},
         page_index::index_reader::decode_offset_index,
-        reader::ChunkReader,
         properties::{EnabledStatistics, WriterProperties},
+        reader::ChunkReader,
     },
     schema::types::ColumnPath,
 };
@@ -101,22 +101,41 @@ impl CorpusRow {
 pub struct ParquetStore {
     directory: PathBuf,
     index: Store,
+    /// False for shared readers, which must not touch files a concurrent writer may own.
+    writable: bool,
 }
 
 impl ParquetStore {
+    /// Opens the corpus for writing; waits briefly for running searches to finish.
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with(directory, false)
+    }
+
+    /// Opens the corpus for reading alongside other readers.
+    pub fn open_shared(directory: &Path) -> Result<Self> {
+        Self::open_with(directory, true)
+    }
+
+    fn open_with(directory: &Path, shared: bool) -> Result<Self> {
         let directory = directory.canonicalize()?;
         let index_path = directory.join(INDEX);
         ensure!(
             index_path.is_file(),
             "missing Parquet index; run parquet seed first"
         );
-        let index = Store::open_parquet_index(&index_path, PROVIDER)?;
-        let corpus = Self { directory, index };
+        let index = Store::open_parquet_index(&index_path, PROVIDER, shared)?;
+        let corpus = Self {
+            directory,
+            index,
+            writable: !shared,
+        };
         corpus.check_files()?;
-        let orphan = part_path(&corpus.directory, next_file_id(&corpus.index.conn)?);
-        remove_if_present(&orphan)?;
-        remove_if_present(&orphan.with_extension("parquet.part"))?;
+        if corpus.writable {
+            // Only a writer can own an unregistered part, so only a writer may clean one up.
+            let orphan = part_path(&corpus.directory, next_file_id(&corpus.index.conn)?);
+            remove_if_present(&orphan)?;
+            remove_if_present(&orphan.with_extension("parquet.part"))?;
+        }
         Ok(corpus)
     }
 
@@ -139,7 +158,7 @@ impl ParquetStore {
             index_path.exists() || fs::read_dir(&directory)?.next().is_none(),
             "seed requires an empty directory or an interrupted Arkhiva seed"
         );
-        let mut index = Store::open_parquet_index(&index_path, PROVIDER)?;
+        let mut index = Store::open_parquet_index(&index_path, PROVIDER, false)?;
         let tx = index.conn.transaction()?;
         let files: i64 =
             tx.query_row("SELECT count(*) FROM parquet_files", [], |row| row.get(0))?;
@@ -179,7 +198,11 @@ impl ParquetStore {
             copy_table(&source, &tx, name)?;
         }
         tx.commit()?;
-        Ok(Self { directory, index })
+        Ok(Self {
+            directory,
+            index,
+            writable: true,
+        })
     }
 
     pub fn migrate_schema(&mut self) -> Result<usize> {
@@ -197,7 +220,8 @@ impl ParquetStore {
             let old_path = part_path(&self.directory, old_id);
             let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&old_path)?)?;
             // Compare fields only: the reader copies file key-value metadata into the schema.
-            if reader.schema().fields() == schema().fields() && has_current_layout(reader.metadata())
+            if reader.schema().fields() == schema().fields()
+                && has_current_layout(reader.metadata())
             {
                 continue;
             }
@@ -281,6 +305,8 @@ impl ParquetStore {
         self.refresh_search_index().context(
             "OAI changes are saved, but the search index refresh failed; rerun sync to retry",
         )?;
+        self.build_lexicon()
+            .context("OAI changes are saved; retry the lexicon with parquet lexicon")?;
         Ok(state)
     }
 
@@ -620,14 +646,19 @@ fn with_offset_index(
             .row_group(group)
             .columns()
             .iter()
-            .map(|column| column.offset_index_range().context("missing Parquet offset index"))
+            .map(|column| {
+                column
+                    .offset_index_range()
+                    .context("missing Parquet offset index")
+            })
             .collect::<Result<Vec<_>>>()?;
         // The writer stores a row group's offset indexes back to back, so one read covers them.
         let start = ranges.iter().map(|range| range.start).min().unwrap_or(0);
         let end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
         let bytes = file.get_bytes(start, usize::try_from(end - start)?)?;
         for (column, range) in ranges.into_iter().enumerate() {
-            let slice = &bytes[usize::try_from(range.start - start)?..usize::try_from(range.end - start)?];
+            let slice =
+                &bytes[usize::try_from(range.start - start)?..usize::try_from(range.end - start)?];
             index.put_offset_index(decode_offset_index(slice)?, group, column);
         }
     }
@@ -712,10 +743,15 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[path = "parquet_store_glossary.rs"]
+mod glossary;
+#[path = "parquet_store_lexicon.rs"]
+mod lexicon;
 #[path = "parquet_store_search.rs"]
 mod search;
 #[path = "parquet_store_topics.rs"]
 mod topics;
+pub use glossary::Glossary;
 pub use search::SearchArgs;
 
 #[cfg(test)]

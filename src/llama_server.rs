@@ -22,6 +22,37 @@ struct Config {
     server_executable: Option<PathBuf>,
     model_file: Option<PathBuf>,
     runtime_library_dir: Option<PathBuf>,
+    // An OpenAI-compatible API; `ARKHIVA_LLM_*` variables override these. The key is never
+    // read from this file, so `api_key` is rejected as an unknown field.
+    api_url: Option<String>,
+    api_model: Option<String>,
+    api_reasoning: Option<String>,
+    api_temperature: Option<f64>,
+    /// "api" or "local"; unset means the API when `api_url` is set, else the local server.
+    llm: Option<Llm>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Llm {
+    Api,
+    Local,
+}
+
+impl Config {
+    /// The API URL to call, or `None` for the local llama-server. `ARKHIVA_LLM_URL` wins.
+    fn api_url(&self, env_url: Option<String>) -> Result<Option<String>> {
+        match (env_url, self.llm) {
+            (Some(url), _) => Ok(Some(url)),
+            (None, Some(Llm::Local)) => Ok(None),
+            (None, Some(Llm::Api)) => self
+                .api_url
+                .clone()
+                .map(Some)
+                .context("\"llm\": \"api\" requires api_url or ARKHIVA_LLM_URL"),
+            (None, None) => Ok(self.api_url.clone()),
+        }
+    }
 }
 
 impl Default for Config {
@@ -32,6 +63,11 @@ impl Default for Config {
             server_executable: None,
             model_file: None,
             runtime_library_dir: None,
+            api_url: None,
+            api_model: None,
+            api_reasoning: None,
+            api_temperature: None,
+            llm: None,
         }
     }
 }
@@ -40,6 +76,15 @@ pub(crate) struct LlamaServer {
     client: Client,
     base: String,
     model: String,
+    remote: Option<Remote>,
+}
+
+/// An OpenAI-compatible API chosen with `ARKHIVA_LLM_URL` or `api_url`; the key stays in the
+/// environment.
+struct Remote {
+    key: Option<String>,
+    temperature: Option<f64>,
+    reasoning: Option<String>,
 }
 
 impl LlamaServer {
@@ -51,6 +96,9 @@ impl LlamaServer {
             Err(error) if error.kind() == ErrorKind::NotFound => Config::default(),
             Err(error) => return Err(error.into()),
         };
+        if let Some(url) = config.api_url(env("ARKHIVA_LLM_URL"))? {
+            return Self::remote(&url, &config);
+        }
         ensure!(config.port != 0, "llama-server port must be nonzero");
         ensure!(
             !config.model_alias.trim().is_empty(),
@@ -70,6 +118,7 @@ impl LlamaServer {
                 .build()?,
             base: format!("http://{address}"),
             model: config.model_alias.clone(),
+            remote: None,
         };
 
         // Each CLI process may start the server. Serialize startup by port.
@@ -223,15 +272,74 @@ impl LlamaServer {
         Ok(())
     }
 
-    pub(crate) fn chat(&self, mut request: Value) -> Result<Value> {
+    fn remote(url: &str, config: &Config) -> Result<Self> {
+        let url = url.trim_end_matches('/');
+        // The key is sent as a bearer token, so plain http is allowed only to this machine.
+        let parsed = reqwest::Url::parse(url).context("the LLM API URL is not a valid URL")?;
+        let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        ensure!(
+            parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback),
+            "the LLM API URL must use https (plain http only for localhost)"
+        );
+        let model = env("ARKHIVA_LLM_MODEL")
+            .or_else(|| config.api_model.clone())
+            .context("an LLM API URL requires ARKHIVA_LLM_MODEL or api_model")?;
+        let temperature = match env("ARKHIVA_LLM_TEMPERATURE") {
+            Some(value) => Some(
+                value
+                    .parse()
+                    .context("ARKHIVA_LLM_TEMPERATURE must be a number")?,
+            ),
+            None => config.api_temperature,
+        };
+        Ok(Self {
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            base: url.to_owned(),
+            model,
+            remote: Some(Remote {
+                key: env("ARKHIVA_LLM_KEY").or_else(|| env("OPENAI_API_KEY")),
+                temperature,
+                reasoning: env("ARKHIVA_LLM_REASONING").or_else(|| config.api_reasoning.clone()),
+            }),
+        })
+    }
+
+    pub(crate) fn chat(&self, mut request: Value, max_tokens: u32) -> Result<Value> {
         request["model"] = Value::String(self.model.clone());
-        let response = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base))
-            .header("Content-Type", "application/json")
+        let mut post = match &self.remote {
+            None => {
+                request["temperature"] = 0.0.into();
+                request["max_tokens"] = max_tokens.into();
+                request["reasoning_effort"] = "none".into();
+                request["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base))
+            }
+            Some(remote) => {
+                // Newer OpenAI models reject max_tokens, and reasoning tokens count toward the cap.
+                request["max_completion_tokens"] = (max_tokens * 5).into();
+                if let Some(temperature) = remote.temperature {
+                    request["temperature"] = temperature.into();
+                }
+                if let Some(reasoning) = &remote.reasoning {
+                    request["reasoning_effort"] = reasoning.as_str().into();
+                }
+                let post = self.client.post(format!("{}/chat/completions", self.base));
+                match &remote.key {
+                    Some(key) => post.bearer_auth(key),
+                    None => post,
+                }
+            }
+        };
+        post = post.header("Content-Type", "application/json");
+        let response = post
             .body(request.to_string())
             .send()
-            .context("requesting structured JSON from local llama-server")?;
+            .with_context(|| format!("requesting a search plan from {}", self.base))?;
         read_json(response)
     }
 }
@@ -287,11 +395,79 @@ mod windows {
     }
 }
 
+fn env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn read_json(response: Response) -> Result<Value> {
     let status = response.status();
     let mut body = Vec::new();
     response.take(65537).read_to_end(&mut body)?;
-    ensure!(body.len() <= 65536, "llama-server response is too large");
-    ensure!(status.is_success(), "llama-server returned HTTP {status}");
+    ensure!(body.len() <= 65536, "LLM response is too large");
+    // An API error body names the reason (unknown model, unsupported field); it holds no key.
+    ensure!(
+        status.is_success(),
+        "LLM returned HTTP {status}: {}",
+        String::from_utf8_lossy(&body[..body.len().min(500)])
+    );
     serde_json::from_slice(&body).context("invalid llama-server JSON response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_holds_api_settings_but_never_a_key() {
+        let config: Config = serde_json::from_str(
+            r#"{"api_url": "https://api.example.com/v1/", "api_model": "m", "api_reasoning": "none", "api_temperature": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(config.port, 18117);
+        assert_eq!(config.api_temperature, Some(0.0));
+        let server = LlamaServer::remote(config.api_url.as_deref().unwrap(), &config).unwrap();
+        assert_eq!(server.base, "https://api.example.com/v1");
+        assert!(serde_json::from_str::<Config>(r#"{"api_key": "x"}"#).is_err());
+        assert!(LlamaServer::remote("http://api.example.com", &config).is_err());
+        for url in [
+            "http://localhost.evil.com/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://localhost@evil.com/v1",
+            "http://127.0.0.1@evil.com/v1",
+            "ftp://localhost/v1",
+        ] {
+            assert!(LlamaServer::remote(url, &config).is_err(), "{url}");
+        }
+        for url in [
+            "http://localhost:8080/v1",
+            "http://127.0.0.1/v1",
+            "http://[::1]:9/v1",
+        ] {
+            assert!(LlamaServer::remote(url, &config).is_ok(), "{url}");
+        }
+
+        let with = |llm: &str| -> Config {
+            serde_json::from_str(&format!(r#"{{"api_url": "https://a/v1", "llm": {llm}}}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            with("null").api_url(None).unwrap().as_deref(),
+            Some("https://a/v1")
+        );
+        assert_eq!(
+            with(r#""api""#).api_url(None).unwrap().as_deref(),
+            Some("https://a/v1")
+        );
+        assert_eq!(with(r#""local""#).api_url(None).unwrap(), None);
+        let env_url = Some("http://env/v1".to_owned());
+        assert_eq!(
+            with(r#""local""#).api_url(env_url).unwrap().as_deref(),
+            Some("http://env/v1")
+        );
+        let api_only: Config = serde_json::from_str(r#"{"llm": "api"}"#).unwrap();
+        assert!(api_only.api_url(None).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"llm": "cloud"}"#).is_err());
+    }
 }

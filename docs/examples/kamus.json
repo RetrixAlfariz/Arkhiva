@@ -1,0 +1,8 @@
+{
+  "kompresi": ["data compression", "lossless compression"],
+  "gudang": ["warehouse", "indoor logistics"],
+  "lansia": ["elderly", "older adults"],
+  "jatuh": ["fall detection"],
+  "YOLO": ["you only look once", "single stage object detection"],
+  "IT": ["information technology"]
+}

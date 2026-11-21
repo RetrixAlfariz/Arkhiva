@@ -4,10 +4,15 @@ pub const PROVIDER: &str = "arxiv";
 
 pub fn arxiv_id(value: &str) -> Result<String> {
     let value = value.trim();
-    let id = ["oai:arXiv.org:", "arXiv:", "arxiv:", "https://arxiv.org/abs/"]
-        .iter()
-        .find_map(|prefix| value.strip_prefix(prefix))
-        .unwrap_or(value);
+    let id = [
+        "oai:arXiv.org:",
+        "arXiv:",
+        "arxiv:",
+        "https://arxiv.org/abs/",
+    ]
+    .iter()
+    .find_map(|prefix| value.strip_prefix(prefix))
+    .unwrap_or(value);
     let id = match id.rsplit_once('v') {
         Some((base, suffix)) if digits(suffix) => base,
         _ => id,

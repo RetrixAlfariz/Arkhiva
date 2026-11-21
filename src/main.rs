@@ -12,7 +12,7 @@ mod store;
 use anyhow::{Context, Result, ensure};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use parquet_store::{ParquetStore, SearchArgs};
+use parquet_store::{Glossary, ParquetStore, SearchArgs};
 use std::{
     fs,
     io::ErrorKind,
@@ -67,6 +67,21 @@ enum Command {
         #[command(subcommand)]
         command: TopicCommand,
     },
+    /// Import your own word lists for smart search into the corpus index.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
+    /// List the kamus or codec entries in the corpus index.
+    List {
+        #[command(subcommand)]
+        command: ListCommand,
+    },
+    /// Remove one kamus or codec entry from the corpus index.
+    Remove {
+        #[command(subcommand)]
+        command: RemoveCommand,
+    },
     Validate {
         #[arg(long)]
         file: PathBuf,
@@ -79,6 +94,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ParquetCommand {
+    /// Compute document frequencies of local corpus phrases.
+    Lexicon,
     /// Seed a Parquet corpus from the validated SQLite database selected by --db.
     Seed,
     /// Upgrade existing Parquet files to the current schema.
@@ -127,6 +144,30 @@ enum TopicCommand {
 }
 
 #[derive(Subcommand)]
+enum ImportCommand {
+    /// Word -> English search terms, as a JSON object: {"kompresi": ["data compression"]}.
+    Kamus { file: PathBuf },
+    /// Word or phrase -> definition, as a JSON object: {"lightweight": "runs on a phone"}.
+    Codec { file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ListCommand {
+    /// Every kamus word with its English terms.
+    Kamus,
+    /// Every codec word or phrase with its definition.
+    Codec,
+}
+
+#[derive(Subcommand)]
+enum RemoveCommand {
+    /// Remove a kamus word; all-capitals words (acronyms) must be typed in capitals.
+    Kamus { word: String },
+    /// Remove a codec word or phrase; all-capitals words must be typed in capitals.
+    Codec { word: String },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCommand {
     Fetch {
         #[arg(long)]
@@ -168,6 +209,7 @@ fn main() -> Result<()> {
         Command::Parquet { directory, command } => {
             let directory = parquet_directory(directory)?;
             match command {
+                ParquetCommand::Lexicon => ParquetStore::open(&directory)?.build_lexicon()?,
                 ParquetCommand::Seed => ParquetStore::seed(&directory, sqlite_db)?.status()?,
                 ParquetCommand::MigrateSchema => {
                     let mut corpus = ParquetStore::open(&directory)?;
@@ -180,7 +222,7 @@ fn main() -> Result<()> {
                     from,
                     full_reconciliation,
                 } => sync_parquet(&directory, bootstrap(from, full_reconciliation))?,
-                ParquetCommand::Status => ParquetStore::open(&directory)?.status()?,
+                ParquetCommand::Status => ParquetStore::open_shared(&directory)?.status()?,
                 ParquetCommand::Search(args) => {
                     search_parquet(&directory, &args, cli.db.is_some())?
                 }
@@ -191,7 +233,7 @@ fn main() -> Result<()> {
                     topic_parquet(&directory, command, cli.db.is_some())?
                 }
                 ParquetCommand::Get { id } => {
-                    serde_json::to_value(ParquetStore::open(&directory)?.get(&id)?)?
+                    serde_json::to_value(ParquetStore::open_shared(&directory)?.get(&id)?)?
                 }
             }
         }
@@ -227,7 +269,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Status if cli.db.is_none() => {
-            ParquetStore::open(&parquet_directory(None)?)?.status()?
+            ParquetStore::open_shared(&parquet_directory(None)?)?.status()?
         }
         Command::Status => {
             ensure!(sqlite_db.is_file(), "database does not exist");
@@ -249,6 +291,39 @@ fn main() -> Result<()> {
         }
         Command::Topic { command } => {
             topic_parquet(&parquet_directory(None)?, command, cli.db.is_some())?
+        }
+        Command::Import { command } => {
+            ensure!(
+                cli.db.is_none(),
+                "imports use the Parquet corpus index; omit --db"
+            );
+            let (kind, file) = match command {
+                ImportCommand::Kamus { file } => (Glossary::Kamus, file),
+                ImportCommand::Codec { file } => (Glossary::Codec, file),
+            };
+            ParquetStore::open(&parquet_directory(None)?)?.import_glossary(kind, &file)?
+        }
+        Command::List { command } => {
+            ensure!(
+                cli.db.is_none(),
+                "lists use the Parquet corpus index; omit --db"
+            );
+            let kind = match command {
+                ListCommand::Kamus => Glossary::Kamus,
+                ListCommand::Codec => Glossary::Codec,
+            };
+            ParquetStore::open_shared(&parquet_directory(None)?)?.list_glossary(kind)?
+        }
+        Command::Remove { command } => {
+            ensure!(
+                cli.db.is_none(),
+                "removals use the Parquet corpus index; omit --db"
+            );
+            let (kind, word) = match command {
+                RemoveCommand::Kamus { word } => (Glossary::Kamus, word),
+                RemoveCommand::Codec { word } => (Glossary::Codec, word),
+            };
+            ParquetStore::open(&parquet_directory(None)?)?.remove_glossary(kind, &word)?
         }
         Command::Validate { file } => {
             ensure!(sqlite_db.is_file(), "database does not exist");
@@ -335,10 +410,11 @@ fn topic_parquet(
         !sqlite_selected,
         "topics use the Parquet corpus index; omit --db"
     );
-    let corpus = ParquetStore::open(directory)?;
     match command {
-        TopicCommand::List => Ok(serde_json::to_value(corpus.list_topics()?)?),
-        TopicCommand::Remove { name } => corpus.remove_topic(&name),
+        TopicCommand::List => Ok(serde_json::to_value(
+            ParquetStore::open_shared(directory)?.list_topics()?,
+        )?),
+        TopicCommand::Remove { name } => ParquetStore::open(directory)?.remove_topic(&name),
     }
 }
 

@@ -24,6 +24,7 @@ use std::{
     num::NonZeroUsize,
     ops::Bound,
     path::Path,
+    time::Instant,
 };
 use tantivy::{
     DocAddress, Index, IndexWriter, Order, Searcher, TantivyDocument, Term,
@@ -32,10 +33,10 @@ use tantivy::{
         sort_key::{SortByStaticFastValue, SortByString},
     },
     directory::MmapDirectory,
+    indexer::NoMergePolicy,
     query::{
         AllQuery, BooleanQuery, BoostQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery,
     },
-    indexer::NoMergePolicy,
     schema::{
         FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions,
     },
@@ -52,9 +53,14 @@ pub struct SearchArgs {
     /// An arXiv ID, link, or case-insensitive terms from the title and abstract.
     #[arg(value_name = "QUERY")]
     query: Option<String>,
-    /// Use local Qwen to turn a research prompt into keywords and arXiv categories.
+    /// Let a model plan the search: facets, anchors and constraints, grounded in the corpus.
+    /// Set ARKHIVA_LLM_URL and ARKHIVA_LLM_MODEL to use an OpenAI-compatible API instead of
+    /// the local llama-server.
     #[arg(long, requires = "query")]
     smart: bool,
+    /// Smart search: list every candidate, not just the top --limit.
+    #[arg(long, requires = "smart")]
+    all: bool,
     /// Save this smart search as a reusable custom topic.
     #[arg(long, requires = "smart")]
     save_topic: Option<String>,
@@ -85,12 +91,20 @@ impl SearchArgs {
     pub fn report(&self, directory: &Path) -> Result<serde_json::Value> {
         if let Some(name) = &self.topic {
             let name = normalize_topic(name)?;
-            return ParquetStore::open(directory)?.search_topic(self, &name);
+            return ParquetStore::open_for_search(directory)?.search_topic(self, &name);
         }
         if !self.smart {
-            return Ok(serde_json::to_value(
-                ParquetStore::open(directory)?.search(self)?,
-            )?);
+            // An ID lookup reads Parquet directly; only text search needs a current Tantivy index.
+            let id_lookup = self
+                .query
+                .as_deref()
+                .is_some_and(|query| arxiv_lookup_id(query).is_ok());
+            let store = if id_lookup {
+                ParquetStore::open_shared(directory)?
+            } else {
+                ParquetStore::open_for_search(directory)?
+            };
+            return Ok(serde_json::to_value(store.search(self)?)?);
         }
         let prompt = self
             .query
@@ -102,25 +116,45 @@ impl SearchArgs {
             .as_deref()
             .map(normalize_topic)
             .transpose()?;
+        // Saving a topic writes to the index database; a plain smart search only reads.
+        let store = if save_name.is_some() {
+            ParquetStore::open(directory)?
+        } else {
+            ParquetStore::open_for_search(directory)?
+        };
+        // Imported kamus and codec entries the prompt names travel with it to the model;
+        // kamus terms are also searched whatever the plan says.
+        let glossary = store.glossary_for(prompt)?;
+        let request = if glossary.lines.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!(
+                "{prompt}\n\nUser glossary (treat as correct; prefer these terms):\n{}",
+                glossary.lines.join("\n")
+            )
+        };
+        // Fail on a missing lexicon here, before the prompt is sent to the model.
+        drop(store.lexicon_df()?);
+        let started = Instant::now();
         let server = LlamaServer::connect(directory)?;
-        let keywords = smart_search::keywords(&server, prompt)?;
-        let store = ParquetStore::open(directory)?;
-        let results = store.search_smart(self, &keywords, |candidates| {
-            smart_search::categories(&server, prompt, &keywords, candidates)
-        })?;
+        let mut plan = smart_search::plan(&server, &request)?;
+        let llm_ms = started.elapsed().as_millis();
+        super::glossary::add_kamus(&mut plan, glossary.kamus);
+        let started = Instant::now();
+        let results = store.search_planned(self, plan.clone())?;
         let mut report = serde_json::to_value(&results)?;
+        report["timings_ms"] = json!({"llm": llm_ms, "search": started.elapsed().as_millis()});
+        if !glossary.lines.is_empty() {
+            report["glossary"] = json!(glossary.lines);
+        }
         if let Some(name) = save_name {
-            let preferred_categories = if self.category.is_none() {
-                results.categories
-            } else {
-                Vec::new()
-            };
             store.save_topic(
                 &name,
                 prompt,
                 &TopicPlan {
-                    keywords,
-                    preferred_categories,
+                    keywords: Vec::new(),
+                    preferred_categories: Vec::new(),
+                    smart: Some(plan),
                     category: self.category.clone(),
                     tag: self.tag.clone(),
                     from: self.from,
@@ -161,7 +195,7 @@ impl SearchArgs {
 }
 
 // `id` is `provider:external_id`; readers derive the URL from it, which keeps output small.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SearchHit {
     id: String,
     title: Option<String>,
@@ -169,6 +203,9 @@ pub struct SearchHit {
     categories: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
+    /// Smart search judges constraints on the whole abstract; never printed.
+    #[serde(skip)]
+    abstract_text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +225,7 @@ impl From<StoredPaper> for SearchHit {
             first_submitted_on: paper.first_submitted_on,
             categories: paper.categories,
             snippet: None,
+            abstract_text: None,
         }
     }
 }
@@ -208,7 +246,6 @@ struct RankedHits {
 }
 
 enum SearchProjection {
-    Categories,
     Metadata,
     WithAbstract,
 }
@@ -276,49 +313,6 @@ impl ParquetStore {
         self.search_with(args, args.query.as_deref(), &[])
     }
 
-    fn search_smart<'a>(
-        &self,
-        args: &SearchArgs,
-        keywords: &'a [String],
-        choose_categories: impl FnOnce(&[&str]) -> Result<Vec<String>>,
-    ) -> Result<SmartSearchReport<'a>> {
-        let text = keywords.join(" ");
-        let (categories, mode, source, hits) = if let Some(category) = args.category.as_deref() {
-            (
-                vec![category.trim().to_owned()],
-                "filter",
-                "manual",
-                self.search_with(args, Some(&text), &[])?,
-            )
-        } else {
-            let mut preview_args = args.clone();
-            preview_args.limit = args.limit.max(NonZeroUsize::new(16).unwrap());
-            let tag = args.validated_tag()?;
-            let mut preview = self.rank_hits(&preview_args, Some(&text), &[], tag.as_deref())?;
-            let categories_by_rank =
-                self.preview_categories(&preview.rows[..preview.rows.len().min(16)])?;
-            let candidates = category_candidates(&categories_by_rank);
-            let (categories, source) = match category_consensus(&categories_by_rank, &candidates) {
-                Some(code) => (vec![code.to_owned()], "consensus"),
-                None => (choose_categories(&candidates)?, "model"),
-            };
-            if categories.is_empty() {
-                preview.rows.truncate(args.limit.get());
-                (categories, "none", "none", self.hydrate_hits(&preview, args.snippets)?)
-            } else {
-                let hits = self.search_with(args, Some(&text), &categories)?;
-                (categories, "preferred", source, hits)
-            }
-        };
-        Ok(SmartSearchReport {
-            keywords,
-            categories,
-            category_mode: mode,
-            category_source: source,
-            hits,
-        })
-    }
-
     pub(super) fn search_topic(&self, args: &SearchArgs, name: &str) -> Result<serde_json::Value> {
         let topic = self.topic(name)?;
         let plan = topic.plan;
@@ -328,6 +322,12 @@ impl ParquetStore {
         args.tag = args.tag.or(plan.tag);
         args.from = args.from.or(plan.from);
         args.to = args.to.or(plan.to);
+        if let Some(smart) = plan.smart {
+            // Topics saved by the planned search replay their plan without calling the model.
+            let mut report = serde_json::to_value(self.search_planned(&args, smart)?)?;
+            report["topic"] = json!(topic.name);
+            return Ok(report);
+        }
         let (categories, inferred, mode) = if let Some(code) = &args.category {
             (vec![code.trim().to_owned()], &[][..], "filter")
         } else if plan.preferred_categories.is_empty() {
@@ -371,7 +371,10 @@ impl ParquetStore {
                     return Ok(Vec::new());
                 }
             }
-            let hit = self.get(&id)?.map(serde_json::from_value::<StoredPaper>).transpose()?;
+            let hit = self
+                .get(&id)?
+                .map(serde_json::from_value::<StoredPaper>)
+                .transpose()?;
             return Ok(hit
                 .into_iter()
                 .map(SearchHit::from)
@@ -525,17 +528,36 @@ impl ParquetStore {
         })
     }
 
+    /// Opens for searching alongside other readers. A seed or interrupted sync can leave the
+    /// index behind its Parquet parts; that refresh runs once under the write lock.
+    pub fn open_for_search(directory: &Path) -> Result<Self> {
+        let store = Self::open_shared(directory)?;
+        if store.search_index_is_current()? {
+            return Ok(store);
+        }
+        drop(store);
+        Self::open(directory)?.refresh_search_index()?;
+        Self::open_shared(directory)
+    }
+
     pub(super) fn refresh_search_index(&self) -> Result<()> {
         self.open_search_index()?;
         Ok(())
     }
 
-    fn open_search_index(&self) -> Result<(Index, Fields)> {
-        let (schema, fields) = Fields::schema();
+    /// True when the Tantivy index covers exactly the registered Parquet parts, so a shared
+    /// reader can search without writing to it.
+    pub(super) fn search_index_is_current(&self) -> Result<bool> {
         let directory = self.directory.join(SEARCH_DIRECTORY);
-        fs::create_dir_all(&directory)?;
-        let index = Index::open_or_create(MmapDirectory::open(&directory)?, schema)?;
+        if !directory.join("meta.json").is_file() {
+            return Ok(false);
+        }
+        let index = Index::open_in_dir(&directory)?;
+        let (parts, indexed) = self.search_parts(&index)?;
+        Ok(parts == indexed)
+    }
 
+    fn search_parts(&self, index: &Index) -> Result<(BTreeMap<i64, Part>, BTreeMap<i64, Part>)> {
         let mut statement = self
             .index
             .conn
@@ -564,6 +586,22 @@ impl ParquetStore {
                 BTreeMap::new()
             }
         };
+        Ok((parts, indexed))
+    }
+
+    fn open_search_index(&self) -> Result<(Index, Fields)> {
+        let (schema, fields) = Fields::schema();
+        let directory = self.directory.join(SEARCH_DIRECTORY);
+        if !self.writable {
+            ensure!(
+                self.search_index_is_current()?,
+                "the search index is out of date; reopen the corpus for writing to refresh it"
+            );
+            return Ok((Index::open_in_dir(&directory)?, fields));
+        }
+        fs::create_dir_all(&directory)?;
+        let index = Index::open_or_create(MmapDirectory::open(&directory)?, schema)?;
+        let (parts, indexed) = self.search_parts(&index)?;
         if parts != indexed {
             let pending: Vec<_> = parts
                 .iter()
@@ -686,15 +724,6 @@ impl ParquetStore {
         Ok(())
     }
 
-    fn preview_categories(&self, rows: &[(i64, usize)]) -> Result<Vec<Vec<String>>> {
-        self.read_search_rows(rows, SearchProjection::Categories, |batch, category| {
-            let data = category_column(batch, category)?;
-            (0..batch.num_rows())
-                .map(|row| Ok(paper_categories(&data, row)?.map(str::to_owned).collect()))
-                .collect()
-        })
-    }
-
     /// Abstracts dominate read cost, so only the top `snippets` hits read them.
     fn hydrate_hits(&self, ranked: &RankedHits, snippets: usize) -> Result<Vec<SearchHit>> {
         let terms = &ranked.terms;
@@ -739,10 +768,6 @@ impl ParquetStore {
             let category_index = layout[TEXT_COLUMNS.len()];
             let category = reader.schema().field(category_index).name().clone();
             match projection {
-                SearchProjection::Categories => {
-                    layout.clear();
-                    layout.push(category_index);
-                }
                 SearchProjection::Metadata => {
                     layout.retain(|&index| reader.schema().field(index).name() != "abstract");
                 }
@@ -822,35 +847,8 @@ fn ranked_rows(searcher: &Searcher, documents: &[DocAddress]) -> Result<Vec<(i64
         .collect()
 }
 
-fn category_candidates(hits: &[Vec<String>]) -> Vec<&str> {
-    let mut categories = BTreeMap::new();
-    for (rank, hit) in hits.iter().take(16).enumerate() {
-        for code in hit {
-            if smart_search::category_name(code).is_some() {
-                *categories.entry(code.as_str()).or_insert(0) += 16 - rank;
-            }
-        }
-    }
-    let mut categories: Vec<_> = categories.into_iter().collect();
-    categories.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
-    categories
-        .into_iter()
-        .take(8)
-        .map(|(code, _)| code)
-        .collect()
-}
-
-fn category_consensus<'a>(hits: &[Vec<String>], candidates: &[&'a str]) -> Option<&'a str> {
-    let top = hits.get(..8)?;
-    let has_code = |hit: &[String], code| hit.iter().any(|value| value == code);
-    let mut common = candidates.iter().filter_map(|&code| {
-        let count = top.iter().filter(|hit| has_code(hit, code)).count();
-        (count >= 6).then_some((code, count))
-    });
-    let (winner, count) = common.next()?;
-    (count >= 7 && common.next().is_none() && top[..3].iter().all(|hit| has_code(hit, winner)))
-        .then_some(winner)
-}
+#[path = "parquet_store_smart.rs"]
+mod smart;
 
 fn term_query(field: Field, text: &str, option: IndexRecordOption) -> Box<dyn Query> {
     Box::new(TermQuery::new(Term::from_field_text(field, text), option))
@@ -928,14 +926,14 @@ impl<'a> PaperColumns<'a> {
     fn hit(&self, row: usize, terms: &[String]) -> Result<SearchHit> {
         let (provider, id) = self.key(row)?;
         let title = text_at(self.title, row);
+        let body = self
+            .body
+            .and_then(|column| text_at(column, row))
+            .filter(|body| !body.is_empty());
         let snippet = if terms.is_empty() {
             None
         } else {
-            self.body
-                .and_then(|column| text_at(column, row))
-                .filter(|body| !body.is_empty())
-                .or(title)
-                .map(|text| snippet(text, terms))
+            body.or(title).map(|text| snippet(text, terms))
         };
         Ok(SearchHit {
             id: format!("{provider}:{id}"),
@@ -943,6 +941,7 @@ impl<'a> PaperColumns<'a> {
             first_submitted_on: self.date(row)?,
             categories: self.categories(row)?.map(str::to_owned).collect(),
             snippet,
+            abstract_text: body.map(str::to_owned),
         })
     }
 }
@@ -997,22 +996,6 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
-
-    #[test]
-    fn consensus_requires_a_dominant_category_across_the_top_eight() {
-        let mut preview = vec![vec!["cs.CV".to_owned()]; 8];
-        preview[7] = vec!["eess.IV".into()];
-        let choose = |hits: &[Vec<String>]| category_consensus(hits, &["eess.IV", "cs.CV"]);
-        assert_eq!(choose(&preview), Some("cs.CV"));
-        assert_eq!(choose(&preview[..7]), None);
-        preview.swap(0, 7);
-        assert_eq!(choose(&preview), None);
-        preview.swap(0, 7);
-        for hit in &mut preview[..5] {
-            hit.push("eess.IV".into());
-        }
-        assert_eq!(choose(&preview), None);
-    }
 
     #[test]
     fn text_category_dates_and_tags_compose_before_limit() -> Result<()> {
@@ -1080,11 +1063,14 @@ mod tests {
         snapshot::import(&mut store, &source, Some("fixture"), 4, None)?;
         snapshot::validate(&store, &source)?;
         drop(store);
-        let parquet = ParquetStore::seed(&directory.path().join("parquet"), &db)?;
+        let parquet_directory = directory.path().join("parquet");
+        let parquet = ParquetStore::seed(&parquet_directory, &db)?;
+        drop(parquet);
 
         let mut query = SearchArgs {
             query: Some("coherence QUANTUM".to_owned()),
             smart: false,
+            all: false,
             save_topic: None,
             topic: None,
             category: Some("QUANT-PH".to_owned()),
@@ -1094,11 +1080,33 @@ mod tests {
             limit: NonZeroUsize::new(3).unwrap(),
             snippets: 5,
         };
+        // An ID lookup reads Parquet without building the full-text index.
+        let mut lookup = query.clone();
+        (lookup.query, lookup.category, lookup.from, lookup.to) =
+            (Some("arxiv:2502.00004".into()), None, None, None);
+        assert_eq!(
+            lookup.report(&parquet_directory)?[0]["id"],
+            "arxiv:2502.00004"
+        );
+        assert!(!parquet_directory.join(SEARCH_DIRECTORY).exists());
+        // Smart search stops on a missing lexicon before contacting any model.
+        (lookup.query, lookup.smart) = (Some("beam splitter calibration".into()), true);
+        let error = lookup.report(&parquet_directory).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("arkhiva parquet lexicon"),
+            "{error:#}"
+        );
+
+        let parquet = ParquetStore::open(&parquet_directory)?;
         let hits = parquet.search(&query)?;
         let mut ids: Vec<_> = hits.iter().map(|hit| hit.id.as_str()).collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["arxiv:2501.00001", "arxiv:2502.00001", "arxiv:2502.00002"]);
+        assert_eq!(
+            ids,
+            ["arxiv:2501.00001", "arxiv:2502.00001", "arxiv:2502.00002"]
+        );
         assert!(hits.iter().all(|hit| hit.snippet.is_some()));
+
         query.snippets = 1;
         let lazy = parquet.search(&query)?;
         assert_eq!(
@@ -1120,16 +1128,88 @@ mod tests {
             parquet.search_with(&query, Some("splitter mismatch"), &["cs.CV".into()])?;
         assert_eq!(smart_hits.len(), 1);
         assert_eq!(smart_hits[0].id, "arxiv:2502.00004");
-        let ranked = parquet.rank_hits(&query, Some("splitter mismatch"), &[], None)?;
-        let preview = parquet.preview_categories(&ranked.rows)?;
-        assert_eq!(preview, [smart_hits[0].categories.clone()]);
-        assert_eq!(category_candidates(&preview), ["quant-ph"]);
-        query.category = Some("cs.CV".into());
-        let words = ["splitter".into()];
-        let filtered = parquet.search_smart(&query, &words, |_| {
-            anyhow::bail!("manual category should bypass model category selection")
-        })?;
-        assert!(filtered.hits.is_empty());
+
+        // Planned search: constraint evidence binds to the topic sentence; avoid only flags.
+        parquet.build_lexicon()?;
+        let mut df = parquet.lexicon_df()?;
+        // Five words: bounded by the rarest three-word piece.
+        assert_eq!(df("quantum coherence after the cutoff")?, 1);
+        assert_eq!(df("quantum coherence after the xylophone")?, 0);
+        drop(df);
+        let group = |name: &str, terms: &[&str]| smart_search::Group {
+            name: name.into(),
+            terms: terms.iter().map(|term| (*term).into()).collect(),
+        };
+        let plan = smart_search::Plan {
+            intent: "topic".into(),
+            anchors: vec!["quantum".into()],
+            facets: vec![group("optics", &["beam splitter", "coherence"])],
+            constraints: vec![group("calibration", &[])],
+            avoid: vec!["dynamics".into()],
+            ..smart_search::Plan::default()
+        };
+        let (from, to) = (query.from.take(), query.to.take());
+        let report = serde_json::to_value(parquet.search_planned(&query, plan.clone())?)?;
+        assert_eq!(report["total"], 7);
+        assert_eq!(report["hits"].as_array().unwrap().len(), 3);
+        query.all = true;
+        let report = serde_json::to_value(parquet.search_planned(&query, plan.clone())?)?;
+        let hits = report["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 7);
+        let splitter = hits
+            .iter()
+            .find(|hit| hit["id"] == "arxiv:2502.00004")
+            .unwrap();
+        assert_eq!(splitter["tier"], "contextual");
+        assert_eq!(splitter["constraints"]["calibration"], "calibration");
+        assert_eq!(splitter["avoid_hit"], "dynamics");
+        assert!(hits.iter().all(|hit| hit.get("abstract_text").is_none()));
+        assert!(splitter.get("snippet").is_some());
+        query.snippets = 0;
+        let quiet = serde_json::to_value(parquet.search_planned(&query, plan)?)?;
+        let quiet = quiet["hits"].as_array().unwrap();
+        assert_eq!(quiet.len(), 7);
+        assert!(quiet.iter().all(|hit| hit.get("snippet").is_none()));
+        query.snippets = 5;
+        (query.from, query.to, query.all) = (from, to, false);
+
+        let kamus = directory.path().join("kamus.json");
+        fs::write(
+            &kamus,
+            r#"{"cahaya": ["beam splitter"], "kuantum": ["quantum"]}"#,
+        )?;
+        let imported = parquet.import_glossary(crate::parquet_store::Glossary::Kamus, &kamus)?;
+        assert_eq!(
+            (imported["imported"].as_u64(), imported["replaced"].as_u64()),
+            (Some(2), Some(0))
+        );
+        fs::write(&kamus, r#"{"cahaya": ["coherence"]}"#)?;
+        assert_eq!(
+            parquet.import_glossary(crate::parquet_store::Glossary::Kamus, &kamus)?["replaced"],
+            1
+        );
+        assert_eq!(
+            parquet.glossary_for("riset cahaya")?.lines,
+            ["- \"cahaya\" = English terms: coherence"]
+        );
+        let kamus_kind = crate::parquet_store::Glossary::Kamus;
+        assert_eq!(
+            parquet.list_glossary(kamus_kind)?,
+            json!({"kamus": {"cahaya": ["coherence"], "kuantum": ["quantum"]}})
+        );
+        assert_eq!(
+            parquet.list_glossary(crate::parquet_store::Glossary::Codec)?,
+            json!({"codec": {}})
+        );
+        assert_eq!(
+            parquet.remove_glossary(kamus_kind, "Cahaya!")?["removed"],
+            true
+        );
+        assert_eq!(
+            parquet.remove_glossary(kamus_kind, "cahaya")?["removed"],
+            false
+        );
+        assert!(parquet.glossary_for("riset cahaya")?.lines.is_empty());
         query.smart = false;
         query.category = Some("QUANT-PH".into());
 

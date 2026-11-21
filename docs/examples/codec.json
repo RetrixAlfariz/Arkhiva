@@ -1,0 +1,5 @@
+{
+  "lightweight": "runs on a microcontroller or phone with under 1 MB of RAM and no GPU",
+  "cepat": "processes at least 100 MB per second on one CPU core",
+  "hemat baterai": "low power use, suitable for battery-powered wearable devices"
+}

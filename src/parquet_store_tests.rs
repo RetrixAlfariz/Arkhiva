@@ -1,6 +1,6 @@
 use super::{
     ParquetStore, REMOVED_COLUMNS, RowSelection, SearchArgs, append_page, has_current_layout,
-    open_part, part_path, topics::TopicPlan, with_offset_index,
+    next_file_id, open_part, part_path, topics::TopicPlan, with_offset_index,
 };
 use crate::{
     arxiv::PROVIDER,
@@ -38,10 +38,7 @@ fn new_only_page_replays_after_file_publication_before_checkpoint() -> Result<()
 
     let mut corpus = ParquetStore::seed(&destination, &sqlite_path)?;
     assert_eq!(corpus.status()?["papers"], 1);
-    assert_eq!(
-        search(&corpus, &["original"])?[0]["id"],
-        "arxiv:2611.00001"
-    );
+    assert_eq!(search(&corpus, &["original"])?[0]["id"], "arxiv:2611.00001");
     assert_eq!(search(&corpus, &["new"])?, serde_json::json!([]));
     let topic_args = search_args(&["--topic", "new-papers"])?;
     corpus.save_topic(
@@ -50,6 +47,7 @@ fn new_only_page_replays_after_file_publication_before_checkpoint() -> Result<()
         &TopicPlan {
             keywords: vec!["new".into()],
             preferred_categories: vec!["cs.AI".into()],
+            smart: None,
             category: None,
             tag: None,
             from: Some("2026-11-15".parse()?),
@@ -60,6 +58,8 @@ fn new_only_page_replays_after_file_publication_before_checkpoint() -> Result<()
         corpus.search_topic(&topic_args, "new-papers")?["hits"],
         serde_json::json!([])
     );
+    assert_eq!(corpus.build_lexicon()?["parts_scanned"], 1);
+    assert_eq!(corpus.build_lexicon()?["parts_scanned"], 0);
     let original = corpus.get("2611.00001v2")?.unwrap();
     assert_eq!(original["title"], "Original");
     assert_eq!(original["abstract"], "Example β");
@@ -105,6 +105,14 @@ fn new_only_page_replays_after_file_publication_before_checkpoint() -> Result<()
     assert_eq!(corpus.status()?["parquet_files"], 2);
     assert_eq!(corpus.status()?["oai"]["next_from"], "2026-11-16");
     assert_eq!(corpus.get("2611.00001")?, Some(original));
+    assert_eq!(corpus.build_lexicon()?["parts_scanned"], 1);
+    let lexicon = rusqlite::Connection::open(destination.join("lexicon-v2.sqlite"))?;
+    let df: i64 =
+        lexicon.query_row("SELECT doc_freq FROM lexicon WHERE phrase='new'", [], |r| {
+            r.get(0)
+        })?;
+    assert_eq!(df, 1);
+    drop(lexicon);
     let legacy_search = destination.join("tantivy-v1");
     fs::create_dir_all(&legacy_search)?;
     corpus.refresh_search_index()?;
@@ -240,6 +248,7 @@ fn schema_migration_keeps_payload_and_checkpoint_after_replay() -> Result<()> {
     assert_eq!(corpus.status()?["papers"], 1);
     assert!(old.is_file());
     write_legacy(&corpus, false)?;
+    assert_eq!(corpus.build_lexicon()?["parts_scanned"], 1);
     corpus
         .index
         .conn
@@ -271,13 +280,24 @@ fn schema_migration_keeps_payload_and_checkpoint_after_replay() -> Result<()> {
     assert_eq!(corpus.migrate_schema()?, 1);
     assert_eq!(corpus.migrate_schema()?, 0);
     assert!(!old.exists());
+    assert_eq!(corpus.build_lexicon()?["parts_scanned"], 1);
+    let lexicon = rusqlite::Connection::open(destination.join("lexicon-v2.sqlite"))?;
+    let frequency: i64 = lexicon.query_row(
+        "SELECT doc_freq FROM lexicon WHERE phrase='complete abstract'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(frequency, 1);
+    drop(lexicon);
 
     // A current-schema file written before the small-page layout is rewritten as well.
     let current_id: i64 =
         corpus
             .index
             .conn
-            .query_row("SELECT max(file_id) FROM parquet_files", [], |row| row.get(0))?;
+            .query_row("SELECT max(file_id) FROM parquet_files", [], |row| {
+                row.get(0)
+            })?;
     let current = part_path(&destination, current_id);
     let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&current)?)?;
     assert!(has_current_layout(reader.metadata()));
@@ -302,10 +322,56 @@ fn schema_migration_keeps_payload_and_checkpoint_after_replay() -> Result<()> {
 }
 
 #[test]
+fn readers_share_the_corpus_while_writers_wait_for_them() -> Result<()> {
+    let temporary = tempdir()?;
+    let snapshot_path = temporary.path().join("snapshot.json");
+    let sqlite_path = temporary.path().join("corpus.sqlite");
+    let destination = temporary.path().join("parquet");
+    fs::write(
+        &snapshot_path,
+        "{\"id\":\"2611.00001\",\"title\":\"Shared reading\",\"abstract\":\"Concurrent lookup\",\
+          \"categories\":\"cs.DB\",\"versions\":[{\"version\":\"v1\",\"created\":\"2026-11-14\"}]}\n",
+    )?;
+    let mut sqlite = Store::open(&sqlite_path, PROVIDER)?;
+    snapshot::import(&mut sqlite, &snapshot_path, Some("fixture"), 4, None)?;
+    snapshot::validate(&sqlite, &snapshot_path)?;
+    drop(sqlite);
+    drop(ParquetStore::seed(&destination, &sqlite_path)?);
+
+    // The first search after a seed builds the index under the write lock, then reads shared.
+    let first = ParquetStore::open_for_search(&destination)?;
+    assert!(first.search_index_is_current()?);
+    let second = ParquetStore::open_for_search(&destination)?;
+    for reader in [&first, &second] {
+        assert_eq!(
+            search(reader, &["concurrent"])?[0]["id"],
+            "arxiv:2611.00001"
+        );
+    }
+
+    // Readers never remove an unregistered part: a concurrent writer may be publishing it.
+    let pending = part_path(&destination, next_file_id(&first.index.conn)?);
+    fs::write(&pending, b"in progress")?;
+    drop(ParquetStore::open_shared(&destination)?);
+    assert!(pending.exists());
+
+    assert!(ParquetStore::open(&destination).is_err());
+    drop(first);
+    drop(second);
+    let writer = ParquetStore::open(&destination)?;
+    assert!(!pending.exists());
+    assert!(ParquetStore::open_shared(&destination).is_err());
+    drop(writer);
+    Ok(())
+}
+
+#[test]
 fn point_reads_load_offset_indexes_for_selected_row_groups_only() -> Result<()> {
     let temporary = tempdir()?;
     let path = temporary.path().join("rows.parquet");
-    let values: Vec<String> = (0..12).map(|n| format!("value-{n}-{}", "x".repeat(40))).collect();
+    let values: Vec<String> = (0..12)
+        .map(|n| format!("value-{n}-{}", "x".repeat(40)))
+        .collect();
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -323,7 +389,10 @@ fn point_reads_load_offset_indexes_for_selected_row_groups_only() -> Result<()> 
     let (file, metadata) = open_part(&path)?;
     assert!(metadata.metadata().page_index().is_none());
     let reader = with_offset_index(file, &metadata, &[2])?;
-    let index = reader.metadata().page_index().context("page index missing")?;
+    let index = reader
+        .metadata()
+        .page_index()
+        .context("page index missing")?;
     assert!(index.offset_index(2, 0).is_some());
     assert!(index.offset_index(0, 0).is_none() && index.offset_index(1, 0).is_none());
     let batch = reader

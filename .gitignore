@@ -4,3 +4,24 @@
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite.lock
+
+# Secrets and local settings
+.env
+.env.*
+arkhiva-llama.json
+arkhiva.corpus
+
+# Models, logs and backups
+*.gguf
+*.log
+*.bak
+*.exe
+
+# Editors and OS
+.vscode/
+.idea/
+.claude/settings.local.json
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
